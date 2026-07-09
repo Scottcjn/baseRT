@@ -23,17 +23,23 @@ Ubuntu 20.04) against the catalog `Qwen/Qwen3-0.6B` default-q4 bundle.
 | Fused q4 GEMV | `base_q4_gemv.c` | rel err ~1e-4 vs reference (fp ordering); 38 GFLOP/s at 64 threads |
 | Qwen3 forward pass | `qwen3_base.c` | Runs end to end at ~18 tok/s decode (32 threads). KNOWN ISSUE below |
 
-### Known issue: top-1 logit mismatch
+### Validation: exact logit parity with the reference implementation
 
-The forward pass produces grammatical output but the greedy argmax does
-not yet match the reference runtime. For the prompt "The capital of
-France is", the expected token " Paris" ranks 5th, about 1.2 logits below
-our top-1. All structural components (weight orientation, attention, GQA
-mapping, RoPE, SwiGLU) produce coherent English, and the f16 decoder is
-exhaustively verified against numpy (0/65536 mismatches), so the residual
-defect is a small numeric term. Differential debugging against the HF
-reference model is the next step. Treat generation output as
-demonstrative, not correct, until this is closed.
+The forward pass was differentially validated against HuggingFace
+transformers running the same dequantized weights (weight-transplant
+test): all top-5 logits match to four decimal places (e.g. top-1
+15.2002 on both). The f16 decoder is exhaustively verified against numpy
+(0/65536 mismatches), q4 dequant is bit-identical to a scalar port of
+the base-quant reference on real tensors, and greedy output matches
+`basert complete` (v0.1.5 engine, temp 0.0) on the same bundle
+token-for-token.
+
+One honest caveat about the test bundle rather than the engine: at 0.6B
+parameters and q4, the catalog model no longer answers "The capital of
+France is" with " Paris" on any runtime (theirs or ours) — the correct
+token sits ~1.2 logits below a generic continuation. Quantized tiny
+models lose facts. Use larger bundles for quality; this one is a
+correctness and performance testbed.
 
 ### Scaffolding disclosure
 

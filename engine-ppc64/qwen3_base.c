@@ -284,6 +284,21 @@ static void forward(int tok, int pos, float *logits, int want_logits) {
         }
         gemv_q4(&L[l].down, ff_g, ff_d);
         for (int i = 0; i < HIDDEN; i++) x[i] += ff_d[i];
+#ifdef DEBUG_NORMS
+        if (want_logits) {   /* only for the last prompt position */
+            double ss = 0; for (int i = 0; i < HIDDEN; i++) ss += (double)x[i]*x[i];
+            fprintf(stderr, "%d:%.3f ", l, sqrt(ss));
+            if (l == NLAYERS-1) fprintf(stderr, "\n");
+        }
+#endif
+#ifdef DEBUG_DUMP
+        if (want_logits) {   /* dump hidden vector after each layer */
+            static FILE *df = NULL;
+            if (!df) df = fopen("hidden_c.bin", "wb");
+            fwrite(x, 4, HIDDEN, df);
+            if (l == NLAYERS-1) fflush(df);
+        }
+#endif
     }
     if (want_logits) {
         rmsnorm(x, final_norm, h, HIDDEN);
