@@ -93,7 +93,67 @@ static void xgsums(const float *x, int K, float *xs) {
         xs[g] = s;
     }
 }
-#ifndef NO_VSX
+#if defined(PSE) && !defined(NO_VSX)
+/* ================= PSE edition =================
+ * Elyan Labs fast path: dcbt weight-stream prefetch + int16 vec_msum.
+ * Activations quantized per group to i16 (rel err ~3e-5, negligible
+ * under q4 weights). Nibbles widen only to i16 (half the merges of the
+ * f32 path); vmsumshm does 8 MACs/instruction vs 4 for vmaddfp.
+ * Accuracy contract: near-exact; the vanilla build is the parity
+ * reference. */
+#define DCBT(p) __asm__ __volatile__("dcbt 0,%0" : : "r"(p) : "memory")
+static void gemv_q4(const T *t, const float *x, float *y) {
+    int K = t->cols, gpr = K / GS;
+    float xs[FFN / GS], xsc[FFN / GS];
+    int16_t xq[FFN] __attribute__((aligned(16)));   /* shared into omp region */
+    if (K > FFN || K % GS != 0) { fprintf(stderr, "gemv_q4: bad K=%d\n", K); exit(1); }
+    xgsums(x, K, xs);
+    /* per-group i16 quantization of activations */
+    for (int g = 0; g < gpr; g++) {
+        const float *xg = x + g * GS;
+        float mx = 1e-20f;
+        for (int i = 0; i < GS; i++) { float a = fabsf(xg[i]); if (a > mx) mx = a; }
+        float s = mx / 32767.0f, inv = 1.0f / s;
+        xsc[g] = s;
+        for (int i = 0; i < GS; i++) xq[g*GS+i] = (int16_t)lrintf(xg[i] * inv);
+    }
+    const vector unsigned char vmask = vec_splats((unsigned char)0x0F);
+    const vector unsigned char vzero = vec_splats((unsigned char)0);
+    const vector unsigned char v4    = vec_splats((unsigned char)4);
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < t->rows; m++) {
+        const uint8_t *row = t->w + (long)m * (K / 2);
+        DCBT(row); DCBT(row + 128);
+        float acc = 0;
+        for (int g = 0; g < gpr; g++) {
+            const uint8_t *p = row + g * (GS / 2);
+            DCBT(p + 256);                     /* stream ahead */
+            const int16_t *xg = xq + g * GS;
+            vector signed int vacc = vec_splats(0);
+            for (int half = 0; half < 2; half++) {
+                vector unsigned char v  = vec_xl(half * 16, p);
+                vector unsigned char lo = vec_and(v, vmask);
+                vector unsigned char hi = vec_sr(v, v4);
+                vector unsigned char q01 = vec_mergeh(lo, hi);   /* q0..q15  */
+                vector unsigned char q23 = vec_mergel(lo, hi);   /* q16..q31 */
+                vector signed short qa = (vector signed short)vec_mergeh(q01, vzero);
+                vector signed short qb = (vector signed short)vec_mergel(q01, vzero);
+                vector signed short qc = (vector signed short)vec_mergeh(q23, vzero);
+                vector signed short qd = (vector signed short)vec_mergel(q23, vzero);
+                const int16_t *xb = xg + half * 32;
+                vacc = vec_msum(qa, (vector signed short)vec_xl(0,  (int16_t*)xb), vacc);
+                vacc = vec_msum(qb, (vector signed short)vec_xl(16, (int16_t*)xb), vacc);
+                vacc = vec_msum(qc, (vector signed short)vec_xl(32, (int16_t*)xb), vacc);
+                vacc = vec_msum(qd, (vector signed short)vec_xl(48, (int16_t*)xb), vacc);
+            }
+            float qdot = (float)(vacc[0] + vacc[1] + vacc[2] + vacc[3]) * xsc[g];
+            long gi = (long)m * gpr + g;
+            acc += t->sc[gi] * qdot + t->bi[gi] * xs[g];
+        }
+        y[m] = acc;
+    }
+}
+#elif !defined(NO_VSX)
 static void gemv_q4(const T *t, const float *x, float *y) {
     int K = t->cols, gpr = K / GS;
     float xs[FFN / GS];

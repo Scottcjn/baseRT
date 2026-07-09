@@ -21,7 +21,21 @@ Ubuntu 20.04) against the catalog `Qwen/Qwen3-0.6B` default-q4 bundle.
 | Container parser | `base_inspect.c` | Matches `basert inspect` field for field on x86-64 and ppc64le |
 | BaseQ4 dequant (VSX) | `base_q4_vsx.c` | Bit-identical to scalar reference on synthetic roundtrip and real tensors; 3.3 Gval/s single thread |
 | Fused q4 GEMV | `base_q4_gemv.c` | rel err ~1e-4 vs reference (fp ordering); 38 GFLOP/s at 64 threads |
-| Qwen3 forward pass | `qwen3_base.c` | Exact logit parity vs reference (below). Qwen3-0.6B: ~18 tok/s decode; Qwen3-4B: ~2.8 tok/s at 64 threads |
+| Qwen3 forward pass | `qwen3_base.c` | Exact logit parity vs reference (below); vanilla and PSE builds, see table |
+
+### Decode throughput (POWER8 S824, 64 threads)
+
+| bundle | vanilla tok/s | PSE tok/s | PSE speedup |
+|--------|---------------|-----------|-------------|
+| Qwen3-0.6B q4 | 18.3 (32T) | - | - |
+| Qwen3-4B q4 | 2.83 | 4.16 | 1.47x |
+| Qwen3-8B q4 | 1.47 | 2.70 | 1.84x |
+
+The PSE build (`-DPSE`) quantizes activations to int16 per group and runs
+the fused GEMV on `vmsumshm` (8 MACs per instruction vs 4 for `vmaddfp`),
+with `dcbt` prefetch on the weight stream. Greedy outputs match the
+vanilla build token for token on our test prompts; top-1 logit deltas are
+~1e-3. The vanilla build remains the parity reference.
 
 ### Validation: exact logit parity with the reference implementation
 
@@ -67,6 +81,7 @@ gcc -O3 -mcpu=power8 -maltivec -mvsx -o base_inspect base_inspect.c
 gcc -O3 -mcpu=power8 -maltivec -mvsx -o base_q4_vsx base_q4_vsx.c -lm
 gcc -O3 -mcpu=power8 -maltivec -mvsx -fopenmp -o base_q4_gemv base_q4_gemv.c -lm
 gcc -O3 -mcpu=power8 -maltivec -mvsx -fopenmp -o qwen3_base qwen3_base.c -lm
+gcc -O3 -DPSE -mcpu=power8 -maltivec -mvsx -fopenmp -o qwen3_pse qwen3_base.c -lm
 
 ./base_inspect model.base
 ./base_q4_vsx selftest && ./base_q4_vsx probe model.base && ./base_q4_vsx bench
