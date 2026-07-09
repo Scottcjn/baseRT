@@ -29,21 +29,14 @@
 #ifndef NO_VSX
 #include <altivec.h>
 #endif
-#include "tensors.h"
+#include "tensors.h"   /* BLOB_OFF, HIDDEN, NLAYERS, ... from the bundle */
 
-#define HIDDEN   1024
-#define NLAYERS  28
-#define NQH      16
-#define NKVH     8
-#define HDIM     128
-#define FFN      3072
-#define VOCAB    151936
 #define GS       64
 #define MAXCTX   256
-#define EPS      1e-6f
-#define ROPE_THETA 1000000.0f
+#define EPS      RMS_EPS
+#define ROPE_THETA ROPE_TH
 
-static const uint64_t BLOB = 0x540000;
+static const uint64_t BLOB = BLOB_OFF;
 
 /* ---------- decode helpers ---------- */
 static float bf16f(uint16_t b){uint32_t u=(uint32_t)b<<16;float f;memcpy(&f,&u,4);return f;}
@@ -75,9 +68,16 @@ static T get_tensor(const char *name) {
                 long ng = (long)t.rows * t.cols / GS;
                 t.sc = malloc(ng * 4); t.bi = malloc(ng * 4);
                 const uint8_t *sr = base + BT[i].soff, *br = base + BT[i].boff;
-                for (long g = 0; g < ng; g++) {
-                    t.sc[g] = bf16f(rd16(sr + 2*g));
-                    t.bi[g] = bf16f(rd16(br + 2*g));
+                if (BT[i].sdt16) {
+                    for (long g = 0; g < ng; g++) {
+                        t.sc[g] = f16f(rd16(sr + 2*g));
+                        t.bi[g] = f16f(rd16(br + 2*g));
+                    }
+                } else {
+                    for (long g = 0; g < ng; g++) {
+                        t.sc[g] = bf16f(rd16(sr + 2*g));
+                        t.bi[g] = bf16f(rd16(br + 2*g));
+                    }
                 }
             }
             return t;
@@ -171,6 +171,22 @@ static void rmsnorm(const float *x, const float *w, float *o, int n) {
 static void decode_f16_vec(const uint8_t *src, float *dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = f16f(rd16(src + 2*i));
 }
+/* embedding row lookup: f16 raw or q4 groupwise */
+static void embed_row(const T *e, int tok, float *dst) {
+    if (!e->is_q4) { decode_f16_vec(e->w + (long)tok * e->cols * 2, dst, e->cols); return; }
+    int gpr = e->cols / GS;
+    const uint8_t *row = e->w + (long)tok * (e->cols / 2);
+    for (int g = 0; g < gpr; g++) {
+        float s = e->sc[(long)tok * gpr + g], b = e->bi[(long)tok * gpr + g];
+        const uint8_t *p = row + g * (GS / 2);
+        float *o = dst + g * GS;
+        for (int i = 0; i < GS / 2; i++) {
+            o[2*i]   = (float)(p[i] & 0x0F) * s + b;
+            o[2*i+1] = (float)(p[i] >> 4)   * s + b;
+        }
+    }
+}
+
 /* neox rope: halves rotation, applied in place to one 128-dim head */
 static void rope(float *h, int pos) {
     for (int i = 0; i < HDIM/2; i++) {
@@ -189,7 +205,7 @@ typedef struct {
 } Layer;
 
 static Layer L[NLAYERS];
-static T lm_head; static const uint8_t *embed;
+static T lm_head, embed_t;
 static float final_norm[HIDDEN];
 static float kcache[NLAYERS][MAXCTX][NKVH*HDIM];
 static float vcache[NLAYERS][MAXCTX][NKVH*HDIM];
@@ -215,8 +231,11 @@ static void load_model(void) {
         snprintf(nm,sizeof nm,"layers.%d.self_attn.k_norm.weight",l);
         decode_f16_vec(get_tensor(nm).w, L[l].kn, HDIM);
     }
-    lm_head = get_tensor("lm_head.weight");
-    embed = get_tensor("embed_tokens.weight").w;
+    embed_t = get_tensor("embed_tokens.weight");
+    int have_lmh = 0;
+    for (int i = 0; i < BT_COUNT; i++)
+        if (!strcmp(BT[i].name, "lm_head.weight")) have_lmh = 1;
+    lm_head = have_lmh ? get_tensor("lm_head.weight") : embed_t;  /* tied */
     decode_f16_vec(get_tensor("final_norm.weight").w, final_norm, HIDDEN);
 }
 
@@ -225,7 +244,7 @@ static void load_model(void) {
 static void forward(int tok, int pos, float *logits, int want_logits) {
     static float x[HIDDEN], h[HIDDEN], q[NQH*HDIM], k[NKVH*HDIM], v[NKVH*HDIM];
     static float attn[NQH*HDIM], ff_g[FFN], ff_u[FFN], ff_d[HIDDEN], o[HIDDEN];
-    decode_f16_vec(embed + (long)tok * HIDDEN * 2, x, HIDDEN);
+    embed_row(&embed_t, tok, x);
 
     for (int l = 0; l < NLAYERS; l++) {
         rmsnorm(x, L[l].in_norm, h, HIDDEN);
@@ -324,7 +343,7 @@ int main(int argc, char **argv) {
     }
 
     load_model();
-    fprintf(stderr, "model loaded (28 layers, scales decoded)\n");
+    fprintf(stderr, "model loaded (%d layers, scales decoded)\n", NLAYERS);
 
     int max_new = atoi(argv[2]);
     int prompt[MAXCTX], plen = 0;
@@ -369,7 +388,7 @@ int main(int argc, char **argv) {
         for (int i = 1; i < VOCAB; i++) if (logits[i] > bv) { bv = logits[i]; best = i; }
         printf(" %d", best); fflush(stdout);
         n_gen++;
-        if (best == 151645 || best == 151643) break;   /* eos */
+        if (best == EOS0 || best == EOS1) break;   /* eos */
         forward(best, pos++, logits, 1);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);

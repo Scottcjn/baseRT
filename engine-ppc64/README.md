@@ -21,7 +21,7 @@ Ubuntu 20.04) against the catalog `Qwen/Qwen3-0.6B` default-q4 bundle.
 | Container parser | `base_inspect.c` | Matches `basert inspect` field for field on x86-64 and ppc64le |
 | BaseQ4 dequant (VSX) | `base_q4_vsx.c` | Bit-identical to scalar reference on synthetic roundtrip and real tensors; 3.3 Gval/s single thread |
 | Fused q4 GEMV | `base_q4_gemv.c` | rel err ~1e-4 vs reference (fp ordering); 38 GFLOP/s at 64 threads |
-| Qwen3 forward pass | `qwen3_base.c` | Runs end to end at ~18 tok/s decode (32 threads). KNOWN ISSUE below |
+| Qwen3 forward pass | `qwen3_base.c` | Exact logit parity vs reference (below). Qwen3-0.6B: ~18 tok/s decode; Qwen3-4B: ~2.8 tok/s at 64 threads |
 
 ### Validation: exact logit parity with the reference implementation
 
@@ -39,7 +39,11 @@ parameters and q4, the catalog model no longer answers "The capital of
 France is" with " Paris" on any runtime (theirs or ours) — the correct
 token sits ~1.2 logits below a generic continuation. Quantized tiny
 models lose facts. Use larger bundles for quality; this one is a
-correctness and performance testbed.
+correctness and performance testbed. With the catalog Qwen3-4B q4 bundle
+(f16 scales, quantized tied embeddings, no separate lm_head — all handled
+via per-tensor dispatch) the engine answers correctly on POWER8:
+"The capital of France is Paris. The capital of Germany is Berlin. The
+capital of Italy is Rome." at ~2.8 tok/s decode, 64 threads.
 
 ### Scaffolding disclosure
 
